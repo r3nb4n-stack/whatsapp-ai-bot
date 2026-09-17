@@ -1,514 +1,720 @@
 import os
 import json
+import logging
+from datetime import datetime
+
 import requests
 import psycopg
-
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 load_dotenv()
 
 app = Flask(__name__)
 
-@app.route("/privacy-policy")
-def privacy_policy():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Privacy Policy - Ren Wp Ai Bot</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-    </head>
-    <body>
-        <h1>Privacy Policy</h1>
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-        <p>This Privacy Policy explains how Ren Wp Ai Bot handles information.</p>
+OPENAI_MODEL = "gpt-5.6-luna"
 
-        <h2>Information We Collect</h2>
-        <p>
-            The bot may store information that users voluntarily provide,
-            such as their name, preferences, and messages, in order to provide
-            personalized responses.
-        </p>
+WHATSAPP_API_URL = (
+    f"https://graph.facebook.com/v25.0/"
+    f"{PHONE_NUMBER_ID}/messages"
+)
 
-        <h2>How We Use Information</h2>
-        <p>
-            Information is used only to provide and improve the bot's
-            conversational features and personalized responses.
-        </p>
-
-        <h2>Third-Party Services</h2>
-        <p>
-            The bot uses WhatsApp Cloud API and OpenAI services to process
-            messages and generate responses.
-        </p>
-
-        <h2>Data Deletion</h2>
-        <p>
-            Users may request deletion of information stored by the bot
-            by contacting the app owner.
-        </p>
-
-        <h2>Contact</h2>
-        <p>
-            For privacy-related questions or deletion requests, please
-            contact the app owner through the associated WhatsApp service.
-        </p>
-
-        <p>Last updated: September 2026</p>
-    </body>
-    </html>
-    """
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "my_verify_token")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-
-OPENAI_URL = "https://api.openai.com/v1/responses"
-
-MAX_HISTORY = 20
+OPENAI_API_URL = "https://api.openai.com/v1/responses"
 
 
-# =========================================================
-# AI PERSONALITY
-# =========================================================
+# ============================================================
+# LOGGING
+# ============================================================
 
-SYSTEM_PROMPT = """
-You are a personal AI assistant running inside WhatsApp.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
-Be friendly, natural, casual and helpful.
-
-Use the user's saved memory and recent conversation when relevant.
-
-Important:
-- Do not invent memories.
-- Do not claim to remember something unless it exists in saved memory.
-- Never reveal API keys, access tokens, passwords or database credentials.
-- Keep normal WhatsApp replies reasonably concise.
-- Explain technical things simply and step-by-step.
-- Use emojis occasionally.
-"""
+logger = logging.getLogger(__name__)
 
 
-# =========================================================
+# ============================================================
+# ENVIRONMENT CHECK
+# ============================================================
+
+def check_environment():
+    required = {
+        "VERIFY_TOKEN": VERIFY_TOKEN,
+        "WHATSAPP_TOKEN": WHATSAPP_TOKEN,
+        "PHONE_NUMBER_ID": PHONE_NUMBER_ID,
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "DATABASE_URL": DATABASE_URL,
+    }
+
+    missing = [name for name, value in required.items() if not value]
+
+    if missing:
+        logger.error(
+            "Missing environment variables: %s",
+            ", ".join(missing)
+        )
+        return False
+
+    logger.info("Environment variables OK")
+    return True
+
+
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-def get_connection():
+def get_db():
     return psycopg.connect(DATABASE_URL)
 
 
 def setup_database():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
 
-    with get_connection() as conn:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        name TEXT DEFAULT '',
+                        facts JSONB DEFAULT '[]'::jsonb,
+                        preferences JSONB DEFAULT '[]'::jsonb
+                    )
+                """)
 
-        with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        id SERIAL PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        user_message TEXT NOT NULL,
+                        assistant_message TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
-                    name TEXT DEFAULT '',
-                    facts JSONB DEFAULT '[]'::jsonb,
-                    preferences JSONB DEFAULT '[]'::jsonb
-                )
-            """)
+            conn.commit()
 
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id SERIAL PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    user_message TEXT NOT NULL,
-                    assistant_message TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        logger.info("Database setup complete")
 
-        conn.commit()
+    except Exception:
+        logger.exception("Database setup failed")
 
 
 def get_user(user_id):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
 
-    with get_connection() as conn:
+                cur.execute(
+                    """
+                    SELECT name, facts, preferences
+                    FROM users
+                    WHERE user_id = %s
+                    """,
+                    (user_id,)
+                )
 
-        with conn.cursor() as cur:
+                row = cur.fetchone()
 
-            cur.execute("""
-                SELECT name, facts, preferences
-                FROM users
-                WHERE user_id = %s
-            """, (user_id,))
+                if row:
+                    name, facts, preferences = row
 
-            row = cur.fetchone()
+                    return {
+                        "name": name or "",
+                        "facts": facts or [],
+                        "preferences": preferences or []
+                    }
 
-            if row:
+                cur.execute(
+                    """
+                    INSERT INTO users
+                    (user_id, name, facts, preferences)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+                    """,
+                    (
+                        user_id,
+                        "",
+                        json.dumps([]),
+                        json.dumps([])
+                    )
+                )
+
+                conn.commit()
+
                 return {
-                    "name": row[0],
-                    "facts": row[1] or [],
-                    "preferences": row[2] or []
+                    "name": "",
+                    "facts": [],
+                    "preferences": []
                 }
 
-            cur.execute("""
-                INSERT INTO users
-                (user_id, name, facts, preferences)
-                VALUES (%s, '', '[]'::jsonb, '[]'::jsonb)
-            """, (user_id,))
-
-        conn.commit()
-
-    return {
-        "name": "",
-        "facts": [],
-        "preferences": []
-    }
+    except Exception:
+        logger.exception("Failed to get/create user")
+        raise
 
 
-def update_user(user_id, name, facts, preferences):
+def save_user(user_id, name, facts, preferences):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
 
-    with get_connection() as conn:
+                cur.execute(
+                    """
+                    INSERT INTO users
+                    (user_id, name, facts, preferences)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        facts = EXCLUDED.facts,
+                        preferences = EXCLUDED.preferences
+                    """,
+                    (
+                        user_id,
+                        name,
+                        json.dumps(facts),
+                        json.dumps(preferences)
+                    )
+                )
 
-        with conn.cursor() as cur:
+            conn.commit()
 
-            cur.execute("""
-                UPDATE users
-                SET name = %s,
-                    facts = %s::jsonb,
-                    preferences = %s::jsonb
-                WHERE user_id = %s
-            """, (
-                name,
-                json.dumps(facts),
-                json.dumps(preferences),
-                user_id
-            ))
-
-        conn.commit()
+    except Exception:
+        logger.exception("Failed to save user memory")
+        raise
 
 
-# =========================================================
-# CONVERSATION HISTORY
-# =========================================================
+def get_conversation_history(user_id, limit=20):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
 
-def get_history(user_id):
+                cur.execute(
+                    """
+                    SELECT user_message, assistant_message
+                    FROM conversations
+                    WHERE user_id = %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (user_id, limit)
+                )
 
-    with get_connection() as conn:
+                rows = cur.fetchall()
 
-        with conn.cursor() as cur:
+        rows.reverse()
 
-            cur.execute("""
-                SELECT user_message, assistant_message
-                FROM conversations
-                WHERE user_id = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (user_id, MAX_HISTORY))
+        return rows
 
-            rows = cur.fetchall()
+    except Exception:
+        logger.exception("Failed to get conversation history")
+        return []
 
-    rows.reverse()
 
-    return [
-        {
-            "user": row[0],
-            "assistant": row[1]
-        }
-        for row in rows
+def save_conversation(user_id, user_message, assistant_message):
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    INSERT INTO conversations
+                    (user_id, user_message, assistant_message)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (
+                        user_id,
+                        user_message,
+                        assistant_message
+                    )
+                )
+
+            conn.commit()
+
+    except Exception:
+        logger.exception("Failed to save conversation")
+
+
+# ============================================================
+# MEMORY COMMANDS
+# ============================================================
+
+def remember_fact(user_id, fact):
+    user = get_user(user_id)
+
+    facts = user["facts"]
+
+    if fact not in facts:
+        facts.append(fact)
+
+    save_user(
+        user_id,
+        user["name"],
+        facts,
+        user["preferences"]
+    )
+
+
+def forget_fact(user_id, text):
+    user = get_user(user_id)
+
+    original_facts = user["facts"]
+    original_preferences = user["preferences"]
+
+    text_lower = text.lower().strip()
+
+    facts = [
+        fact for fact in original_facts
+        if text_lower not in str(fact).lower()
     ]
 
+    preferences = [
+        pref for pref in original_preferences
+        if text_lower not in str(pref).lower()
+    ]
 
-def save_history(user_id, user_message, assistant_message):
+    save_user(
+        user_id,
+        user["name"],
+        facts,
+        preferences
+    )
 
-    with get_connection() as conn:
+    removed = (
+        len(original_facts) != len(facts)
+        or len(original_preferences) != len(preferences)
+    )
 
-        with conn.cursor() as cur:
-
-            cur.execute("""
-                INSERT INTO conversations
-                (user_id, user_message, assistant_message)
-                VALUES (%s, %s, %s)
-            """, (
-                user_id,
-                user_message,
-                assistant_message
-            ))
-
-        conn.commit()
+    return removed
 
 
-# =========================================================
-# BUILD PROMPT
-# =========================================================
+def process_memory_command(user_id, message):
+    """
+    Returns a reply if the message is a memory command.
+    Otherwise returns None.
+    """
 
-def build_prompt(user_id, message):
+    text = message.strip()
+    lower = text.lower()
 
     user = get_user(user_id)
 
-    history = get_history(user_id)
+    # --------------------------------------------------------
+    # remember:
+    # --------------------------------------------------------
 
-    memory_text = json.dumps(user, indent=2)
+    if lower.startswith("remember:"):
 
-    history_text = ""
+        fact = text[len("remember:"):].strip()
 
-    for item in history:
+        if not fact:
+            return "Tell me what you want me to remember."
 
-        history_text += (
-            f"User: {item['user']}\n"
-            f"Assistant: {item['assistant']}\n"
-        )
+        remember_fact(user_id, fact)
 
-    return f"""
-{SYSTEM_PROMPT}
+        return f"Got it — I'll remember that."
 
-=========================
-SAVED PERSONAL MEMORY
-=========================
+    # --------------------------------------------------------
+    # forget:
+    # --------------------------------------------------------
 
-{memory_text}
+    if lower.startswith("forget:"):
 
-=========================
-RECENT CONVERSATION
-=========================
+        fact = text[len("forget:"):].strip()
 
-{history_text}
+        if not fact:
+            return "Tell me what you want me to forget."
 
-=========================
-CURRENT USER MESSAGE
-=========================
+        removed = forget_fact(user_id, fact)
 
-User: {message}
+        if removed:
+            return "Okay, I've removed that from your stored memory."
 
-Respond naturally to the user.
+        return "I couldn't find that in your stored memory."
+
+    # --------------------------------------------------------
+    # my name is ...
+    # --------------------------------------------------------
+
+    if lower.startswith("my name is "):
+
+        name = text[len("my name is "):].strip()
+
+        if name:
+            save_user(
+                user_id,
+                name,
+                user["facts"],
+                user["preferences"]
+            )
+
+            return f"Nice to meet you, {name}! I'll remember your name."
+
+    # --------------------------------------------------------
+    # I like ...
+    # --------------------------------------------------------
+
+    if lower.startswith("i like "):
+
+        preference = text[len("i like "):].strip()
+
+        if preference:
+            preferences = user["preferences"]
+
+            if preference not in preferences:
+                preferences.append(preference)
+
+            save_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                preferences
+            )
+
+            return f"Got it — I'll remember that you like {preference}."
+
+    # --------------------------------------------------------
+    # I love ...
+    # --------------------------------------------------------
+
+    if lower.startswith("i love "):
+
+        preference = text[len("i love "):].strip()
+
+        if preference:
+            preferences = user["preferences"]
+
+            if preference not in preferences:
+                preferences.append(preference)
+
+            save_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                preferences
+            )
+
+            return f"Got it — I'll remember that you love {preference}."
+
+    # --------------------------------------------------------
+    # I don't like ...
+    # --------------------------------------------------------
+
+    if lower.startswith("i don't like "):
+
+        preference = text[len("i don't like "):].strip()
+
+        if preference:
+            preferences = user["preferences"]
+
+            item = f"doesn't like {preference}"
+
+            if item not in preferences:
+                preferences.append(item)
+
+            save_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                preferences
+            )
+
+            return f"Got it — I'll remember that you don't like {preference}."
+
+    # --------------------------------------------------------
+    # What do you remember?
+    # --------------------------------------------------------
+
+    memory_questions = [
+        "what do you remember about me",
+        "what do you remember",
+        "what do you know about me",
+        "what do you know"
+    ]
+
+    if lower in memory_questions:
+
+        user = get_user(user_id)
+
+        result = []
+
+        if user["name"]:
+            result.append(f"Name: {user['name']}")
+
+        if user["facts"]:
+            result.append(
+                "Facts:\n" +
+                "\n".join(
+                    f"- {fact}"
+                    for fact in user["facts"]
+                )
+            )
+
+        if user["preferences"]:
+            result.append(
+                "Preferences:\n" +
+                "\n".join(
+                    f"- {pref}"
+                    for pref in user["preferences"]
+                )
+            )
+
+        if not result:
+            return "I don't have any saved information about you yet."
+
+        return "\n\n".join(result)
+
+    return None
+
+
+# ============================================================
+# OPENAI
+# ============================================================
+
+def extract_openai_text(data):
+    """
+    Extract generated text from the Responses API JSON.
+    """
+
+    # Some API responses may provide output_text directly.
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"].strip()
+
+    output = data.get("output", [])
+
+    texts = []
+
+    for item in output:
+
+        if not isinstance(item, dict):
+            continue
+
+        content = item.get("content", [])
+
+        if not isinstance(content, list):
+            continue
+
+        for part in content:
+
+            if not isinstance(part, dict):
+                continue
+
+            if part.get("type") == "output_text":
+
+                text = part.get("text", "")
+
+                if text:
+                    texts.append(text)
+
+    return "\n".join(texts).strip()
+
+
+def generate_ai_reply(user_id, user_message):
+    user = get_user(user_id)
+
+    history = get_conversation_history(user_id, limit=20)
+
+    system_prompt = """
+You are a personal AI assistant communicating through WhatsApp.
+
+Be helpful, friendly, natural, and conversational.
+
+You have access to stored memory about the user.
+Use it when relevant, but do not mention internal databases,
+PostgreSQL, API keys, webhooks, or implementation details unless
+the user specifically asks about the bot's technical implementation.
+
+Do not claim to remember something unless it appears in the
+provided memory.
+
+Keep normal WhatsApp replies reasonably concise.
+
+If the user asks something technical, explain it clearly and
+step-by-step when appropriate.
 """
 
+    memory_text = f"""
+Stored user information:
 
-# =========================================================
-# OPENAI
-# =========================================================
+Name:
+{user["name"] or "Not stored"}
 
-def ask_ai(user_id, message):
+Facts:
+{json.dumps(user["facts"], ensure_ascii=False)}
 
-    if not OPENAI_API_KEY:
-        return "OpenAI API key is not configured."
+Preferences:
+{json.dumps(user["preferences"], ensure_ascii=False)}
+"""
+
+    conversation_text = ""
+
+    if history:
+        conversation_text = "\nRecent conversation:\n"
+
+        for old_user, old_assistant in history:
+            conversation_text += (
+                f"User: {old_user}\n"
+                f"Assistant: {old_assistant}\n"
+            )
+
+    full_input = f"""
+{memory_text}
+
+{conversation_text}
+
+Current user message:
+{user_message}
+"""
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    data = {
-        "model": "gpt-5.6-luna",
-        "input": build_prompt(user_id, message)
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": system_prompt,
+        "input": full_input
     }
 
-    try:
+    logger.info("Calling OpenAI Responses API")
 
+    try:
         response = requests.post(
-            OPENAI_URL,
+            OPENAI_API_URL,
             headers=headers,
-            json=data,
-            timeout=60
+            json=payload,
+            timeout=90
+        )
+
+        logger.info(
+            "OpenAI HTTP status: %s",
+            response.status_code
         )
 
         if response.status_code != 200:
 
-            print("OpenAI Error:")
-            print(response.text)
+            logger.error(
+                "OpenAI API error: %s",
+                response.text[:2000]
+            )
 
-            return "Sorry, I couldn't process that right now."
+            return (
+                "Sorry, I'm having trouble connecting to my AI service "
+                "right now. Please try again in a moment."
+            )
 
-        result = response.json()
+        data = response.json()
 
-        reply = ""
-
-        for item in result.get("output", []):
-
-            for content in item.get("content", []):
-
-                if content.get("type") == "output_text":
-
-                    reply += content.get("text", "")
-
-        reply = reply.strip()
+        reply = extract_openai_text(data)
 
         if not reply:
 
-            return "I couldn't generate a reply."
+            logger.error(
+                "OpenAI returned no text. Response keys: %s",
+                list(data.keys())
+            )
 
-        save_history(
-            user_id,
-            message,
-            reply
-        )
+            return (
+                "I received an empty response from the AI. "
+                "Please try again."
+            )
+
+        logger.info("OpenAI response received successfully")
 
         return reply
 
-    except Exception as error:
+    except requests.Timeout:
 
-        print("OpenAI Error:")
-        print(error)
+        logger.exception("OpenAI request timed out")
 
-        return "Sorry, something went wrong."
-
-
-# =========================================================
-# PROCESS MESSAGE
-# =========================================================
-
-def process_message(user_id, message):
-
-    user = get_user(user_id)
-
-    lower = message.lower().strip()
-
-
-    # REMEMBER
-    if lower.startswith("remember:"):
-
-        fact = message[len("remember:"):].strip()
-
-        if not fact:
-            return "Tell me what you want me to remember."
-
-        if fact not in user["facts"]:
-            user["facts"].append(fact)
-
-        update_user(
-            user_id,
-            user["name"],
-            user["facts"],
-            user["preferences"]
+        return (
+            "The AI took too long to respond. "
+            "Please try again."
         )
 
-        return "🧠 I'll remember that."
+    except Exception:
 
+        logger.exception("Unexpected OpenAI error")
 
-    # FORGET
-    if lower.startswith("forget:"):
-
-        fact = message[len("forget:"):].strip()
-
-        if not fact:
-            return "Tell me what you want me to forget."
-
-        removed = False
-
-        for item in user["facts"][:]:
-
-            if item.lower() == fact.lower():
-
-                user["facts"].remove(item)
-                removed = True
-
-        for item in user["preferences"][:]:
-
-            if item.lower() == fact.lower():
-
-                user["preferences"].remove(item)
-                removed = True
-
-        update_user(
-            user_id,
-            user["name"],
-            user["facts"],
-            user["preferences"]
+        return (
+            "Something went wrong while generating my reply. "
+            "Please try again."
         )
 
-        if removed:
-            return "🧹 I've removed that from my saved memory."
 
-        return "I couldn't find that in my saved memory."
+# ============================================================
+# WHATSAPP
+# ============================================================
 
+def send_whatsapp_message(recipient, message):
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
-    # NAME
-    if "my name is " in lower:
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message
+        }
+    }
 
-        position = lower.index("my name is ")
+    logger.info("Sending WhatsApp reply")
 
-        name = message[
-            position + len("my name is "):
-        ].strip()
+    try:
+        response = requests.post(
+            WHATSAPP_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
 
-        if name:
+        logger.info(
+            "WhatsApp API status: %s",
+            response.status_code
+        )
 
-            user["name"] = name
+        if response.status_code >= 400:
 
-            update_user(
-                user_id,
-                user["name"],
-                user["facts"],
-                user["preferences"]
+            logger.error(
+                "WhatsApp API error: %s",
+                response.text[:2000]
             )
 
+            return False
 
-    # LIKE
-    elif lower.startswith("i like "):
+        return True
 
-        if message not in user["preferences"]:
+    except requests.Timeout:
 
-            user["preferences"].append(message)
+        logger.exception("WhatsApp API request timed out")
 
-            update_user(
-                user_id,
-                user["name"],
-                user["facts"],
-                user["preferences"]
-            )
+        return False
 
+    except Exception:
 
-    # LOVE
-    elif lower.startswith("i love "):
+        logger.exception("Unexpected WhatsApp sending error")
 
-        if message not in user["preferences"]:
-
-            user["preferences"].append(message)
-
-            update_user(
-                user_id,
-                user["name"],
-                user["facts"],
-                user["preferences"]
-            )
+        return False
 
 
-    # DON'T LIKE
-    elif lower.startswith("i don't like "):
-
-        if message not in user["preferences"]:
-
-            user["preferences"].append(message)
-
-            update_user(
-                user_id,
-                user["name"],
-                user["facts"],
-                user["preferences"]
-            )
-
-
-    return ask_ai(user_id, message)
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-@app.route("/", methods=["GET"])
-def home():
-
-    return jsonify({
-        "status": "online",
-        "bot": "Personal WhatsApp AI Bot"
-    })
-
-
-# =========================================================
-# WEBHOOK VERIFICATION
-# =========================================================
+# ============================================================
+# WHATSAPP WEBHOOK
+# ============================================================
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -517,182 +723,92 @@ def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
+    logger.info("Webhook verification request received")
+
     if mode == "subscribe" and token == VERIFY_TOKEN:
 
+        logger.info("Webhook verification successful")
+
         return challenge, 200
+
+    logger.warning("Webhook verification failed")
 
     return "Verification failed", 403
 
 
-# =========================================================
-# WHATSAPP WEBHOOK
-# =========================================================
-
 @app.route("/webhook", methods=["POST"])
-def whatsapp_webhook():
+def webhook():
 
-    data = request.get_json(silent=True)
-
-    if not data:
-
-        return jsonify({
-            "status": "ignored"
-        }), 200
+    logger.info("========================================")
+    logger.info("Webhook POST received")
+    logger.info("========================================")
 
     try:
 
-        entry = data["entry"][0]
+        data = request.get_json(silent=True)
 
-        changes = entry["changes"][0]
+        if not data:
 
-        value = changes["value"]
+            logger.warning("Webhook contained no JSON")
 
-        messages = value.get("messages", [])
+            return "EVENT_RECEIVED", 200
 
-        if not messages:
-
-            return jsonify({
-                "status": "no message"
-            }), 200
-
-        message = messages[0]
-
-        if message.get("type") != "text":
-
-            return jsonify({
-                "status": "ignored"
-            }), 200
-
-        sender = message["from"]
-
-        text = message["text"]["body"]
-
-        print(
-            f"Message from {sender}: {text}"
+        logger.info(
+            "Webhook object: %s",
+            data.get("object")
         )
 
-        reply = process_message(
-            sender,
-            text
-        )
+        entries = data.get("entry", [])
 
-        send_whatsapp_message(
-            sender,
-            reply
-        )
+        if not entries:
 
-    except Exception as error:
+            logger.info("No entries in webhook")
 
-        print("Webhook error:")
-        print(error)
+            return "EVENT_RECEIVED", 200
 
-    return jsonify({
-        "status": "ok"
-    }), 200
+        for entry in entries:
 
+            changes = entry.get("changes", [])
 
-# =========================================================
-# SEND WHATSAPP MESSAGE
-# =========================================================
+            for change in changes:
 
-def send_whatsapp_message(to, message):
+                value = change.get("value", {})
 
-    if not WHATSAPP_TOKEN:
+                messages = value.get("messages", [])
 
-        print("WhatsApp token is missing.")
-        return
+                if not messages:
 
-    if not PHONE_NUMBER_ID:
+                    logger.info(
+                        "Webhook event has no messages "
+                        "(probably status/update event)"
+                    )
 
-        print("Phone Number ID is missing.")
-        return
+                    continue
 
-    url = (
-        f"https://graph.facebook.com/v25.0/"
-        f"{PHONE_NUMBER_ID}/messages"
-    )
+                for message in messages:
 
-    headers = {
-        "Authorization":
-            f"Bearer {WHATSAPP_TOKEN}",
+                    message_type = message.get("type")
 
-        "Content-Type":
-            "application/json"
-    }
+                    logger.info(
+                        "WhatsApp message type: %s",
+                        message_type
+                    )
 
-    data = {
-        "messaging_product":
-            "whatsapp",
+                    # ------------------------------------------------
+                    # Only process text messages
+                    # ------------------------------------------------
 
-        "to":
-            to,
+                    if message_type != "text":
 
-        "type":
-            "text",
+                        logger.info(
+                            "Ignoring non-text message: %s",
+                            message_type
+                        )
 
-        "text": {
-            "body":
-                message
-        }
-    }
+                        continue
 
-    try:
+                    sender = message.get("from")
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=data,
-            timeout=30
-        )
+                    text_data = message.get("text", {})
 
-        if response.status_code != 200:
-
-            print("WhatsApp Error:")
-            print(response.text)
-
-    except Exception as error:
-
-        print("WhatsApp request error:")
-        print(error)
-
-
-# =========================================================
-# START
-# =========================================================
-
-if __name__ == "__main__":
-
-    print("🤖 Personal WhatsApp AI Bot")
-
-    print("🚀 Starting server...")
-
-    if DATABASE_URL:
-
-        try:
-
-            setup_database()
-
-            print("🐘 PostgreSQL connected.")
-
-        except Exception as error:
-
-            print("Database connection error:")
-            print(error)
-
-    else:
-
-        print("DATABASE_URL is missing.")
-
-
-    port = int(
-        os.getenv(
-            "PORT",
-            5000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-        )
+                
