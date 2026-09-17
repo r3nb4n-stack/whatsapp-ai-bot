@@ -129,9 +129,21 @@ def setup_database():
                 )
             """)
 
+            # Upgrade existing databases created by older versions
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS
-                idx_conversations_user_time
+                ALTER TABLE conversations
+                ADD COLUMN IF NOT EXISTS message_id TEXT
+            """)
+
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                conversations_message_id_unique
+                ON conversations(message_id)
+                WHERE message_id IS NOT NULL
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conversations_user_time
                 ON conversations(user_id, created_at DESC)
             """)
 
