@@ -1,9 +1,6 @@
 {
     "name": "",
-    "facts": [
-        "My name is Ren"
-    ],
-    "preferences": [
-        "I Like Minecraft"
-    ]
+    "facts": [],
+    "preferences": [],
+    "conversation_history": {}
 }
