@@ -1,6 +1,8 @@
 import os
 import json
 import requests
+import psycopg
+
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -9,17 +11,17 @@ load_dotenv()
 app = Flask(__name__)
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "my_verify_token")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 OPENAI_URL = "https://api.openai.com/v1/responses"
 
-MEMORY_FILE = "memory.json"
 MAX_HISTORY = 20
 
 
@@ -30,69 +32,112 @@ MAX_HISTORY = 20
 SYSTEM_PROMPT = """
 You are a personal AI assistant running inside WhatsApp.
 
-Be friendly, natural, conversational and helpful.
-
-Your personality:
-- Friendly
-- Natural
-- Casual
-- Helpful
-- Not robotic
+Be friendly, natural, casual and helpful.
 
 Use the user's saved memory and recent conversation when relevant.
 
 Important:
 - Do not invent memories.
 - Do not claim to remember something unless it exists in saved memory.
-- Never reveal API keys, access tokens, passwords or other secrets.
+- Never reveal API keys, access tokens, passwords or database credentials.
 - Keep normal WhatsApp replies reasonably concise.
-- For technical questions, explain things simply and step-by-step.
-- Use emojis occasionally, but do not overuse them.
+- Explain technical things simply and step-by-step.
+- Use emojis occasionally.
 """
 
 
 # =========================================================
-# MEMORY
+# DATABASE
 # =========================================================
 
-def default_memory():
+def get_connection():
+    return psycopg.connect(DATABASE_URL)
+
+
+def setup_database():
+
+    with get_connection() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    name TEXT DEFAULT '',
+                    facts JSONB DEFAULT '[]'::jsonb,
+                    preferences JSONB DEFAULT '[]'::jsonb
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    user_message TEXT NOT NULL,
+                    assistant_message TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+        conn.commit()
+
+
+def get_user(user_id):
+
+    with get_connection() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT name, facts, preferences
+                FROM users
+                WHERE user_id = %s
+            """, (user_id,))
+
+            row = cur.fetchone()
+
+            if row:
+                return {
+                    "name": row[0],
+                    "facts": row[1] or [],
+                    "preferences": row[2] or []
+                }
+
+            cur.execute("""
+                INSERT INTO users
+                (user_id, name, facts, preferences)
+                VALUES (%s, '', '[]'::jsonb, '[]'::jsonb)
+            """, (user_id,))
+
+        conn.commit()
+
     return {
         "name": "",
         "facts": [],
-        "preferences": [],
-        "conversation_history": {}
+        "preferences": []
     }
 
 
-def load_memory():
+def update_user(user_id, name, facts, preferences):
 
-    try:
+    with get_connection() as conn:
 
-        with open(MEMORY_FILE, "r") as file:
-            memory = json.load(file)
+        with conn.cursor() as cur:
 
-        memory.setdefault("name", "")
-        memory.setdefault("facts", [])
-        memory.setdefault("preferences", [])
-        memory.setdefault("conversation_history", {})
+            cur.execute("""
+                UPDATE users
+                SET name = %s,
+                    facts = %s::jsonb,
+                    preferences = %s::jsonb
+                WHERE user_id = %s
+            """, (
+                name,
+                json.dumps(facts),
+                json.dumps(preferences),
+                user_id
+            ))
 
-        return memory
-
-    except (FileNotFoundError, json.JSONDecodeError):
-
-        memory = default_memory()
-        save_memory(memory)
-
-        return memory
-
-
-def save_memory(memory):
-
-    with open(MEMORY_FILE, "w") as file:
-        json.dump(memory, file, indent=4)
-
-
-memory = load_memory()
+        conn.commit()
 
 
 # =========================================================
@@ -101,52 +146,72 @@ memory = load_memory()
 
 def get_history(user_id):
 
-    return memory["conversation_history"].get(user_id, [])
+    with get_connection() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT user_message, assistant_message
+                FROM conversations
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (user_id, MAX_HISTORY))
+
+            rows = cur.fetchall()
+
+    rows.reverse()
+
+    return [
+        {
+            "user": row[0],
+            "assistant": row[1]
+        }
+        for row in rows
+    ]
 
 
 def save_history(user_id, user_message, assistant_message):
 
-    if user_id not in memory["conversation_history"]:
+    with get_connection() as conn:
 
-        memory["conversation_history"][user_id] = []
+        with conn.cursor() as cur:
 
-    memory["conversation_history"][user_id].append({
-        "user": user_message,
-        "assistant": assistant_message
-    })
+            cur.execute("""
+                INSERT INTO conversations
+                (user_id, user_message, assistant_message)
+                VALUES (%s, %s, %s)
+            """, (
+                user_id,
+                user_message,
+                assistant_message
+            ))
 
-    memory["conversation_history"][user_id] = (
-        memory["conversation_history"][user_id][-MAX_HISTORY:]
-    )
-
-    save_memory(memory)
+        conn.commit()
 
 
 # =========================================================
-# BUILD AI PROMPT
+# BUILD PROMPT
 # =========================================================
 
 def build_prompt(user_id, message):
 
-    memory_text = json.dumps(
-        {
-            "name": memory.get("name", ""),
-            "facts": memory.get("facts", []),
-            "preferences": memory.get("preferences", [])
-        },
-        indent=2
-    )
+    user = get_user(user_id)
+
+    history = get_history(user_id)
+
+    memory_text = json.dumps(user, indent=2)
 
     history_text = ""
 
-    for item in get_history(user_id):
+    for item in history:
 
         history_text += (
             f"User: {item['user']}\n"
             f"Assistant: {item['assistant']}\n"
         )
 
-    prompt = f"""
+    return f"""
 {SYSTEM_PROMPT}
 
 =========================
@@ -170,8 +235,6 @@ User: {message}
 Respond naturally to the user.
 """
 
-    return prompt
-
 
 # =========================================================
 # OPENAI
@@ -180,7 +243,6 @@ Respond naturally to the user.
 def ask_ai(user_id, message):
 
     if not OPENAI_API_KEY:
-
         return "OpenAI API key is not configured."
 
     headers = {
@@ -237,10 +299,10 @@ def ask_ai(user_id, message):
 
     except Exception as error:
 
-        print("OpenAI request error:")
+        print("OpenAI Error:")
         print(error)
 
-        return "Sorry, something went wrong while processing your message."
+        return "Sorry, something went wrong."
 
 
 # =========================================================
@@ -249,76 +311,70 @@ def ask_ai(user_id, message):
 
 def process_message(user_id, message):
 
-    global memory
+    user = get_user(user_id)
 
     lower = message.lower().strip()
 
 
-    # -----------------------------------------------------
     # REMEMBER
-    # -----------------------------------------------------
-
     if lower.startswith("remember:"):
 
         fact = message[len("remember:"):].strip()
 
         if not fact:
-
             return "Tell me what you want me to remember."
 
-        if fact not in memory["facts"]:
+        if fact not in user["facts"]:
+            user["facts"].append(fact)
 
-            memory["facts"].append(fact)
-            save_memory(memory)
+        update_user(
+            user_id,
+            user["name"],
+            user["facts"],
+            user["preferences"]
+        )
 
         return "🧠 I'll remember that."
 
 
-    # -----------------------------------------------------
     # FORGET
-    # -----------------------------------------------------
-
     if lower.startswith("forget:"):
 
         fact = message[len("forget:"):].strip()
 
         if not fact:
-
             return "Tell me what you want me to forget."
 
         removed = False
 
-
-        for item in memory["facts"][:]:
-
-            if item.lower() == fact.lower():
-
-                memory["facts"].remove(item)
-                removed = True
-
-
-        for item in memory["preferences"][:]:
+        for item in user["facts"][:]:
 
             if item.lower() == fact.lower():
 
-                memory["preferences"].remove(item)
+                user["facts"].remove(item)
                 removed = True
 
+        for item in user["preferences"][:]:
 
-        save_memory(memory)
+            if item.lower() == fact.lower():
 
+                user["preferences"].remove(item)
+                removed = True
+
+        update_user(
+            user_id,
+            user["name"],
+            user["facts"],
+            user["preferences"]
+        )
 
         if removed:
-
             return "🧹 I've removed that from my saved memory."
 
         return "I couldn't find that in my saved memory."
 
 
-    # -----------------------------------------------------
     # NAME
-    # -----------------------------------------------------
-
     if "my name is " in lower:
 
         position = lower.index("my name is ")
@@ -329,58 +385,66 @@ def process_message(user_id, message):
 
         if name:
 
-            memory["name"] = name
-            save_memory(memory)
+            user["name"] = name
+
+            update_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                user["preferences"]
+            )
 
 
-    # -----------------------------------------------------
     # LIKE
-    # -----------------------------------------------------
-
     elif lower.startswith("i like "):
 
-        if message not in memory["preferences"]:
+        if message not in user["preferences"]:
 
-            memory["preferences"].append(message)
-            save_memory(memory)
+            user["preferences"].append(message)
 
-
-    # -----------------------------------------------------
-    # DON'T LIKE
-    # -----------------------------------------------------
-
-    elif lower.startswith("i don't like "):
-
-        if message not in memory["preferences"]:
-
-            memory["preferences"].append(message)
-            save_memory(memory)
+            update_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                user["preferences"]
+            )
 
 
-    # -----------------------------------------------------
     # LOVE
-    # -----------------------------------------------------
-
     elif lower.startswith("i love "):
 
-        if message not in memory["preferences"]:
+        if message not in user["preferences"]:
 
-            memory["preferences"].append(message)
-            save_memory(memory)
+            user["preferences"].append(message)
+
+            update_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                user["preferences"]
+            )
 
 
-    # -----------------------------------------------------
-    # SEND TO AI
-    # -----------------------------------------------------
+    # DON'T LIKE
+    elif lower.startswith("i don't like "):
 
-    return ask_ai(
-        user_id,
-        message
-    )
+        if message not in user["preferences"]:
+
+            user["preferences"].append(message)
+
+            update_user(
+                user_id,
+                user["name"],
+                user["facts"],
+                user["preferences"]
+            )
+
+
+    return ask_ai(user_id, message)
 
 
 # =========================================================
-# HOME / HEALTH CHECK
+# HOME
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -393,7 +457,7 @@ def home():
 
 
 # =========================================================
-# WHATSAPP WEBHOOK VERIFICATION
+# WEBHOOK VERIFICATION
 # =========================================================
 
 @app.route("/webhook", methods=["GET"])
@@ -403,17 +467,15 @@ def verify_webhook():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
 
         return challenge, 200
-
 
     return "Verification failed", 403
 
 
 # =========================================================
-# WHATSAPP INCOMING MESSAGE
+# WHATSAPP WEBHOOK
 # =========================================================
 
 @app.route("/webhook", methods=["POST"])
@@ -421,13 +483,11 @@ def whatsapp_webhook():
 
     data = request.get_json(silent=True)
 
-
     if not data:
 
         return jsonify({
             "status": "ignored"
         }), 200
-
 
     try:
 
@@ -437,11 +497,7 @@ def whatsapp_webhook():
 
         value = changes["value"]
 
-        messages = value.get(
-            "messages",
-            []
-        )
-
+        messages = value.get("messages", [])
 
         if not messages:
 
@@ -449,9 +505,7 @@ def whatsapp_webhook():
                 "status": "no message"
             }), 200
 
-
         message = messages[0]
-
 
         if message.get("type") != "text":
 
@@ -459,34 +513,28 @@ def whatsapp_webhook():
                 "status": "ignored"
             }), 200
 
-
         sender = message["from"]
 
         text = message["text"]["body"]
 
-
         print(
             f"Message from {sender}: {text}"
         )
-
 
         reply = process_message(
             sender,
             text
         )
 
-
         send_whatsapp_message(
             sender,
             reply
         )
 
-
     except Exception as error:
 
         print("Webhook error:")
         print(error)
-
 
     return jsonify({
         "status": "ok"
@@ -502,25 +550,19 @@ def send_whatsapp_message(to, message):
     if not WHATSAPP_TOKEN:
 
         print("WhatsApp token is missing.")
-
         return
-
 
     if not PHONE_NUMBER_ID:
 
         print("Phone Number ID is missing.")
-
         return
-
 
     url = (
         f"https://graph.facebook.com/v25.0/"
         f"{PHONE_NUMBER_ID}/messages"
     )
 
-
     headers = {
-
         "Authorization":
             f"Bearer {WHATSAPP_TOKEN}",
 
@@ -528,9 +570,7 @@ def send_whatsapp_message(to, message):
             "application/json"
     }
 
-
     data = {
-
         "messaging_product":
             "whatsapp",
 
@@ -541,32 +581,24 @@ def send_whatsapp_message(to, message):
             "text",
 
         "text": {
-
             "body":
                 message
         }
     }
 
-
     try:
 
         response = requests.post(
-
             url,
-
             headers=headers,
-
             json=data,
-
             timeout=30
         )
-
 
         if response.status_code != 200:
 
             print("WhatsApp Error:")
             print(response.text)
-
 
     except Exception as error:
 
@@ -575,14 +607,31 @@ def send_whatsapp_message(to, message):
 
 
 # =========================================================
-# START SERVER
+# START
 # =========================================================
 
 if __name__ == "__main__":
 
     print("🤖 Personal WhatsApp AI Bot")
 
-    print("🚀 Server starting...")
+    print("🚀 Starting server...")
+
+    if DATABASE_URL:
+
+        try:
+
+            setup_database()
+
+            print("🐘 PostgreSQL connected.")
+
+        except Exception as error:
+
+            print("Database connection error:")
+            print(error)
+
+    else:
+
+        print("DATABASE_URL is missing.")
 
 
     port = int(
@@ -592,12 +641,8 @@ if __name__ == "__main__":
         )
     )
 
-
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
         debug=False
-    )
+        )
