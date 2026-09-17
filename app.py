@@ -136,11 +136,10 @@ def setup_database():
             """)
 
             cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS
-                conversations_message_id_unique
-                ON conversations(message_id)
-                WHERE message_id IS NOT NULL
-            """)
+    CREATE UNIQUE INDEX IF NOT EXISTS
+    conversations_message_id_unique
+    ON conversations(message_id)
+""")
 
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_conversations_user_time
