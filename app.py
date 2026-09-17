@@ -10,6 +10,56 @@ load_dotenv()
 
 app = Flask(__name__)
 
+@app.route("/privacy-policy")
+def privacy_policy():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Privacy Policy - Ren Wp Ai Bot</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body>
+        <h1>Privacy Policy</h1>
+
+        <p>This Privacy Policy explains how Ren Wp Ai Bot handles information.</p>
+
+        <h2>Information We Collect</h2>
+        <p>
+            The bot may store information that users voluntarily provide,
+            such as their name, preferences, and messages, in order to provide
+            personalized responses.
+        </p>
+
+        <h2>How We Use Information</h2>
+        <p>
+            Information is used only to provide and improve the bot's
+            conversational features and personalized responses.
+        </p>
+
+        <h2>Third-Party Services</h2>
+        <p>
+            The bot uses WhatsApp Cloud API and OpenAI services to process
+            messages and generate responses.
+        </p>
+
+        <h2>Data Deletion</h2>
+        <p>
+            Users may request deletion of information stored by the bot
+            by contacting the app owner.
+        </p>
+
+        <h2>Contact</h2>
+        <p>
+            For privacy-related questions or deletion requests, please
+            contact the app owner through the associated WhatsApp service.
+        </p>
+
+        <p>Last updated: September 2026</p>
+    </body>
+    </html>
+    """
+
 # =========================================================
 # CONFIG
 # =========================================================
